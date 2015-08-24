@@ -64,7 +64,7 @@ The following are notes on each of the primary functions working "inside-out"
 using an example from Allison's little green survival analysis book:
 
 ```{r setup example, message=FALSE, warning=FALSE, error=FALSE}
-library(haven); library(survival); library(coxme); library(dplyr);
+library(haven); library(survival); library(coxme); library(dplyr); library(ggplot2);
 arrests <- read_dta("http://statisticalhorizons.com/wp-content/uploads/arrests.dta")
 
 (m1 <- coxme(Surv(length, arrind)~
@@ -98,12 +98,12 @@ On to the `agsurv()` calculations (currently the calculations ignore the strata 
 `survfitcoxph.fit()` currently sends each stratum to the function by itself):
 
 ```{r MYagsurv}
-MYagsurv <- function(y, x, wt, risk, survtype, vartype) {
+MYagsurv <- function(y, x, wt, risk, survtype=3, vartype=3) {
     nvar <- ncol(as.matrix(x))
     status <- y[, ncol(y)]
     dtime <- y[, ncol(y) - 1]
     death <- (status == 1)
-    stime <- sort(unique(dtime))
+    time <- sort(unique(dtime))
     nevent <- as.vector(rowsum(wt * death, dtime))
     ncens <- as.vector(rowsum(wt * (!death), dtime))
     wrisk <- c(wt * risk)  #Had to add c() to remove the dimnames so that the multiplication later would work
@@ -165,8 +165,12 @@ MYagsurv <- function(y, x, wt, risk, survtype, vartype) {
         varhaz = varhaz, ndeath = ndeath, xbar = apply(matrix(xbar, 
         ncol = nvar), 2, cumsum))
     
-    if (survtype == 1) 
-        result$surv <- km$inc
+    if (survtype == 1) {
+      result$surv <- cumprod(km$inc)
+    }
+    else {
+      result$surv <- exp(-result$cumhaz)
+    }
     
     return(result)
 }
@@ -174,6 +178,11 @@ MYagsurv <- function(y, x, wt, risk, survtype, vartype) {
 
 str(MYagsurv(y, x, wt, risk, survtype, vartype))
 ```
+
+Aside from working from a `coxme.object` the big difference between this
+function and the original is that I output the `$surv` item for all types
+of computational types. In `survfit.coxph()` this takes place in 
+`survfitcoxph.fit()`.
 
 Now that we have these calculations working (###CHECK WITH COUNTING PROCESS 
 DATA###) the remaining tasks are:
@@ -193,11 +202,202 @@ own front end to prepare the data for the specific problems I am facing.
 Most of these two functions are re-creating the data frames,instead of 
 saving them into the model object.  For my case, that means I need to pass
 the stratum variable and send the frames to `MYagsurv()` by the stratum 
-varible.
-
-I also want to send a new data.frame. 
+varible. I also want to send a new data.frame. 
 
 ### By stratum variable
 
+First I need to provide a stratum variable from the original frame.
 
+```{r specify strata}
+strata <- arrests$race
+```
 
+```{r MYsurvfit prep2}
+#lifted from survfitcoxph.fit
+if (is.factor(strata)) {
+  ustrata <- levels(strata)
+} else ustrata <- sort(unique(strata))
+
+nstrata <- length(ustrata)
+survlist <- vector("list", nstrata)
+names(survlist) <- ustrata
+for (i in 1:nstrata) {
+  indx <- which(strata == ustrata[i])
+  survlist[[i]] <- MYagsurv(y[indx, , drop = F], x[indx, , drop = F], wt[indx], risk[indx], survtype, vartype)
+}
+
+#Returns a list of MYagsurvs of length(unique(strata))
+str(survlist)
+
+#We can plot the "baseline" survival functions for each stratum with
+data.frame(
+  time=c(survlist[[1]]$time, survlist[[2]]$time),
+  surv=c(survlist[[1]]$surv, survlist[[2]]$surv),
+  strata = c(rep(names(survlist), lapply(survlist, function(x) length(x$time))))
+  ) %>%
+ggplot(aes(x=time, y=surv, color=strata)) +
+  geom_path() +
+  theme_bw() +
+  labs(x="Time", y="Survival Function") +
+  scale_x_continuous(limits=c(0, 450))
+```
+
+This works perfectly.
+
+### New prediction data.frame and specifying the random effects
+
+The key to this is calculating the risk scores from the new data.frames. Once
+that is done, calculating the survival curves is very straightforward. Now, I 
+want this to be fairly flexible, so I have created 4 different newdata 
+scenarios:
+
+```{r specify newdata}
+#Specify full data frame 
+newdata1 <- data.frame(
+  fin=c(1,0), 
+  age=c(25,30), 
+  male=c(0,1), 
+  married=c(1,0), 
+  paro=c(1,0), 
+  numprop=c(0,2), 
+  crimprop=c(0,1), 
+  numarst=c(5,15), 
+  edcomb=c(18,12), 
+  race=c(1,1), 
+  id=c(10,10)
+)
+
+#Specify data without grouping term
+newdata2 <- select(newdata1, -id)
+
+#Specify data without grouping term or strata
+newdata3 <- select(newdata1, -id, -race)
+
+#Specify data with only partial covariates
+newdata4 <- select(newdata1, -paro, -numarst, -edcomb, -id)
+
+#Single row
+newdata5 <- newdata2[1,]
+
+```
+
+And I also want to insert a placeholder to add the random intercept to the
+predicted value:
+
+```{r specify rfx}
+#We'll do one for now (the largest random intercept is nearly two)
+rfx <- 1.0
+```
+
+Calculating `newrisk` is done in the main survfit.coxph function. It uses the
+`terms` object from the model and the model frame created using model.frame.
+
+```{r calc newrisk, error=TRUE}
+MYrisk <- function(object, newdata, rfx=0) {
+  dMat <- survival:::model.matrix.coxph(object, newdata)
+  newrisk <- exp(dMat %*% fixef(object) + rfx)
+  return(newrisk)
+}
+
+(newrisk1 <- MYrisk(m1, newdata1, rfx))
+(newrisk1a <-  MYrisk(m1, newdata1[,11:1], rfx))
+(newrisk2 <- MYrisk(m1, newdata2, rfx))
+(newrisk3 <- MYrisk(m1, newdata3, rfx))
+(newrisk4 <- MYrisk(m1, newdata4, rfx))
+(newrisk5 <- MYrisk(m1, newdata5, rfx))
+
+```
+
+So, this little function works of all of the regular predictors and any 
+stratifying factor is specified, but not if it is missing the stratifier
+and/or any of the regular predictors.
+
+Now that we have `newrisk` calculated, we can calculated the survival 
+and cumulative hazard functions as follows:
+
+```{r calc survival & cumhaz & se for newdata}
+predSurv <- function(survlist, newrisk) {
+  n.survlist <- length(survlist)
+  strata.names <- names(survlist) 
+  n.newrisk <- nrow(newrisk)
+  
+  for (i in 1:n.survlist) {
+    survlist[[i]]$surv <- as.data.frame(outer(survlist[[i]]$surv, newrisk, "^"))
+      colnames(survlist[[i]]$surv) <- paste("Surv_newdata_row", 1:n.newrisk, sep="")
+    survlist[[i]]$cumhaz <- as.data.frame(outer(survlist[[i]]$cumhaz, newrisk, "*"))
+      colnames(survlist[[i]]$cumhaz) <- paste("CumHaz_newdata_row", 1:n.newrisk, sep="")
+    survlist[[i]]$newrisk <- newrisk
+      dimnames(survlist[[i]]$newrisk)[[1]] <- paste("newdata_row", 1:n.newrisk, sep="")
+  }
+  
+  return(survlist)
+}
+
+str(survHat <- predSurv(survlist, newrisk5))
+   
+```            
+
+OK; the object `survHat` is similar to the output in `survlist` but contains
+the predicted survival and cumulative hazard functions for each of the 
+cases submitted in the `newdata` argument.  
+
+All we need now is to extract the probability of survival for a given time.
+This functionality is located in the unexported function `summary.survfit()`.
+The hard part, as noted by Therneau, is interpolating user-supplied time 
+points at which there are no observed exits. 
+
+As I understand it, the approach taken by `summary.coxph()` is actually not to 
+interpolate.  Instead, the process involves choosing the correct row of the 
+`survfit` object to use. The issue is complicated by the fact that you cannot 
+be at risk after you die, so we want to if the user-supplied time falls between
+two rows, we want to use the:
+
+  - survival probabilities (`surv`): *preceding row*
+  - number at risk (`n.risk`):       *following row*
+  - number censored (`n.censor`):    *.*
+  - number events (`n.event`):       *.*
+
+However, in my situation, I have plenty of time points that are close enough 
+together (the largest time between two consecutive rows is less than 0.006, 
+except at the tail end), so I am just going to take the linear interpolation of 
+the survival probabilities surrounding the user-supplied time point. 
+
+I am also moving back to a world in which only a single row of `newdata` is
+passed to the predSurv function, because I don't want to deal with multiple
+rows right now.
+
+```{r survival probability at given time, error=TRUE}
+#This doesn't match anything from survHat[[1]], but does for survHat[[2]]
+#so we can see if both the matching and interpolation match
+newtime <- 100
+
+survProbs <- function(survHat, newtime) {
+  out <- NULL
+  for (i in 1:length(survHat)) {
+    if (any(newtime == survHat[[i]]$time)) {
+      idx <- survHat[[i]]$time==newtime
+      out[[i]] <- data.frame(
+        Time=survHat[[i]]$time[idx],
+        `Survival Probability`=survHat[[i]]$surv[idx,1],
+        `Cumulative Incidence`=1-survHat[[i]]$surv[idx,1]
+      )
+    } else{
+      btwnrows <- c(max(survHat[[i]]$time[survHat[[i]]$time<newtime]), min(survHat[[i]]$time[survHat[[i]]$time>newtime]))
+      idx <- survHat[[i]]$time %in% btwnrows
+      interpDF <- data.frame(
+        time=survHat[[i]]$time[idx],
+        surv=survHat[[i]]$surv[idx,1]
+      )
+      out[[i]] <- data.frame(
+        Time=newtime,
+        `Survival Probability`=approx(x=interpDF[,"time"], y=interpDF[,"surv"], xout=newtime)$y
+      )
+      out[[i]]$`Cumulative Incidence`=1-out[[i]][,2]
+    }
+  }
+  return(out)
+}
+
+survProbs(survHat, newtime)
+
+```
