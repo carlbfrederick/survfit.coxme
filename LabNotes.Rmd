@@ -399,5 +399,6 @@ survProbs <- function(survHat, newtime) {
 }
 
 (survProbs(survHat, newtime))
-
 ```
+
+
