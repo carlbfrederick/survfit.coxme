@@ -382,7 +382,8 @@ survProbs <- function(survHat, newtime) {
         `Cumulative Incidence`=1-survHat[[i]]$surv[idx,1]
       )
     } else{
-      btwnrows <- c(max(survHat[[i]]$time[survHat[[i]]$time<newtime]), min(survHat[[i]]$time[survHat[[i]]$time>newtime]))
+      btwnrows <- c(max(survHat[[i]]$time[survHat[[i]]$time<newtime]), 
+                    min(survHat[[i]]$time[survHat[[i]]$time>newtime]))
       idx <- survHat[[i]]$time %in% btwnrows
       interpDF <- data.frame(
         time=survHat[[i]]$time[idx],
@@ -401,4 +402,5 @@ survProbs <- function(survHat, newtime) {
 (survProbs(survHat, newtime))
 ```
 
-
+Yay!  Everything seems to work on this toy example.  Now I just have to put it 
+together into a single function to ease the process.
