@@ -398,6 +398,6 @@ survProbs <- function(survHat, newtime) {
   return(out)
 }
 
-survProbs(survHat, newtime)
+(survProbs(survHat, newtime))
 
 ```
