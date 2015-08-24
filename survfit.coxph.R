@@ -1,4 +1,4 @@
-function (formula, newdata, se.fit = TRUE, conf.int = 0.95, 
+survfit.coxph <- function (formula, newdata, se.fit = TRUE, conf.int = 0.95, 
     individual = FALSE, type, vartype, conf.type = c("log", 
         "log-log", "plain", "none"), censor = TRUE, id, na.action = na.pass, 
     ...) 

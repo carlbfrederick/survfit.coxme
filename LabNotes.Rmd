@@ -1,0 +1,203 @@
+---
+title: "survfit.coxme Notebook"
+output: html_document
+---
+
+# Ultimate Goal
+
+Want to be able to say things like the probability of survival (or 1-survival)
+by time X for school Y is `_________`
+
+# Task
+
+Write a `survfit` method for a `coxme` object. My first attempt was a hack-y 
+attempt to back-convert a coxme object into an artificial coxph, but this did
+not work. 
+
+My current attempt is to make it work for my own, special case.
+
+# `coxme` vs `coxph` objects
+
+I am using `coxph.survit` as the model so this section lists the differences 
+so that I have a list of what I may need to modify/create from my `coxme.object`.
+Luckily, both objects area well documented so the information below comes from 
+my observations and the help files. In the table below starred items are only 
+present *if* certain options are called.
+
+| Item name          | Description                | `coxme` analog                  | Notes:                        |
+|:-------------------|:---------------------------|:--------------------------------|:------------------------------|
+| coefficients       | Vector of coefficients     | `fixef(coxme.object)`           | Identical                     |
+| var                | Variance matrix of coefs   | `vcov(coxme.object)`            | Identical                     |
+| naive.var*         | Un-robust coef Var matrix  | n/a                             | Only present if robust==TRUE  |
+| loglik             | Num. vector, length 2      | `coxme.object$loglik`           | Coxme is named and length 3   |
+| score              | efficient score test       | n/a                             | Doubt it is necessary         |
+| rscore*            | robust log-rank stat       | n/a                             | Only present if robust==TRUE  |
+| wald.test          | test final = initial coefs | n/a                             | Doubt it is necessary         |
+| iter               | num iterations, length 1   | `coxme.object$iter`             | Coxme is length 2             |
+| linear.predictors  | xB, centered               | `coxme.object$linear.predictor` | Coxme includes RFX            |
+| residuals          | Martingale residuals       | n/a                             | Doubt it is necessary         |
+| means              | named vector o pred. means | `coxme.object$means`            | coxme is *not* named          |
+| n                  | n obs used in fit          | `coxme.object$n`                | coxme contains nevent then n  |
+| nevent             | # events used in fit       | `coxme.object$n`                | ditto                         |
+| weights            | vector of weights          | n/a                             | I am not using weights        |
+| method             | computation method used    | `coxme.object$ties`             | this is crucial               |
+| na.action          | na.action                  | `coxme.object$na.action`        | Identical                     |
+| terms              | formula w/ multiple attr   | `coxme.object$terms`            | NOT IDENTICAL                 |
+| assign             | list of positions of coefs | n/a                             | doubt it is necessary         |
+| formula            | formula                    | `coxme.object$formula`          | coxme: list of fixed and rand |
+| call               | matched call               | `coxme.object$call`             | Doubt it is necessary         |
+| x*                 | model matrix used          | `coxme.object$x`                | Identical                     |
+| y*                 | response used              | `coxme.object$y`                | Identical                     |
+| frame*             | model frame used           | `coxme.object$model`            | Identical                     |
+
+The only other thing from the coxme object we need is the random effects, 
+`ranef(coxme.object)`. For this initial attempt, I am going to limit it to
+my special case of a random intercept. If I wanted predictions based on the
+data as they are, then I could just use the `coxme.object$linear.predictor`
+which has already incorporated the estimated random effect ... *but* I want
+to look at the impact of various random effects on Survival (or cumulative 
+incidence), so I need to calculate with or without the random effect.
+
+# Existing `survfit.coxph` functions
+
+The following are notes on each of the primary functions working "inside-out"
+using an example from Allison's little green survival analysis book:
+
+```{r setup example, message=FALSE, warning=FALSE, error=FALSE}
+library(haven); library(survival); library(coxme); library(dplyr);
+arrests <- read_dta("http://statisticalhorizons.com/wp-content/uploads/arrests.dta")
+
+(m1 <- coxme(Surv(length, arrind)~
+               fin+age+male+married+paro+numprop+crimprop+numarst+edcomb+strata(race)+(1|id), 
+             data=arrests, y = TRUE, x=TRUE))
+```
+
+## `agsurv()`
+
+This is the function that does the heavy lifting of the calculations by calling
+the appropriate C routine ... one of `Cagsurv4` or `Cagsurv5` depending on the 
+type of calculations desired. Ours is `Cagsurv5`.
+
+I will do the `agsurv` function calculations on the `m1` example above. First I
+assign all the values that are passed to the function properly: `y`, `x`, and `wt`
+are self-explanatory. The second three values are calculated by `survfit.coxph()`;
+`risk` is the exponentiated linear predictor, `survtype` and `vartype` specify the 
+computation method. The default for `coxme` is "efron", so both are equal to 3.
+
+```{r agsurv1}
+y <- m1$y
+x <- m1$x
+wt <- rep(1, nrow(y))
+
+risk <-  exp(x %*% fixef(m1))       
+survtype <- 3   
+vartype <-  3   
+```
+
+On to the `agsurv()` calculations (currently the calculations ignore the strata ... 
+`survfitcoxph.fit()` currently sends each stratum to the function by itself):
+
+```{r MYagsurv}
+MYagsurv <- function(y, x, wt, risk, survtype, vartype) {
+    nvar <- ncol(as.matrix(x))
+    status <- y[, ncol(y)]
+    dtime <- y[, ncol(y) - 1]
+    death <- (status == 1)
+    stime <- sort(unique(dtime))
+    nevent <- as.vector(rowsum(wt * death, dtime))
+    ncens <- as.vector(rowsum(wt * (!death), dtime))
+    wrisk <- c(wt * risk)  #Had to add c() to remove the dimnames so that the multiplication later would work
+    
+    rcumsum <- function(x) rev(cumsum(rev(x)))
+    nrisk <- rcumsum(rowsum(wrisk, dtime))
+    irisk <- rcumsum(rowsum(wt, dtime))
+    
+    if (ncol(y) == 2) {
+        temp2 <- rowsum(wrisk * x, dtime)
+        xsum <- apply(temp2, 2, rcumsum)
+    } else {
+        delta <- min(diff(time))/2
+        etime <- c(sort(unique(y[, 1])), max(y[, 1]) + delta)
+        indx <- approx(etime, 1:length(etime), time, method = "constant", 
+            rule = 2, f = 1)$y
+        esum <- rcumsum(rowsum(wrisk, y[, 1]))
+        nrisk <- nrisk - c(esum, 0)[indx]
+        irisk <- irisk - c(rcumsum(rowsum(wt, y[, 1])), 0)[indx]
+        xout <- apply(rowsum(wrisk * x, y[, 1]), 2, rcumsum)
+        xin <- apply(rowsum(wrisk * x, dtime), 2, rcumsum)
+        xsum <- xin - (rbind(xout, 0))[indx, , drop = F]
+    }
+
+    #Calculate number of deaths and number of times
+    ndeath <- rowsum(status, dtime)
+    ntime <- length(time)
+    
+    #Final calcs, send all of this stuff to the proper C subroutine
+    if (survtype == 1) {
+        indx <- (which(status == 1))[order(dtime[status == 1])]
+        km <- .C(survival:::Cagsurv4, as.integer(ndeath), as.double(risk[indx]), 
+            as.double(wt[indx]), as.integer(ntime), as.double(nrisk), 
+            inc = double(ntime))
+    }
+    
+    if (survtype == 3 || vartype == 3) {
+      xsum2 <- rowsum((wrisk * death) * x, dtime)
+      erisk <- rowsum(wrisk * death, dtime)
+  
+      tsum <- .C(survival:::Cagsurv5, as.integer(length(nevent)), as.integer(nvar), 
+                 as.integer(ndeath), as.double(nrisk), as.double(erisk), 
+                 as.double(xsum), as.double(xsum2), sum1 = double(length(nevent)), 
+                 sum2 = double(length(nevent)), xbar = matrix(0, 
+                 length(nevent), nvar))
+    }
+    
+    #Calc hazard rates, etc and wrap up results
+    haz <- switch(survtype, nevent/nrisk, nevent/nrisk, nevent * 
+        tsum$sum1)
+    varhaz <- switch(vartype, nevent/(nrisk * ifelse(nevent >= 
+        nrisk, nrisk, nrisk - nevent)), nevent/nrisk^2, nevent * 
+        tsum$sum2)
+    xbar <- switch(vartype, (xsum/nrisk) * haz, (xsum/nrisk) * 
+        haz, nevent * tsum$xbar)
+
+    result <- list(n = nrow(y), time = time, n.event = nevent, 
+        n.risk = irisk, n.censor = ncens, hazard = haz, cumhaz = cumsum(haz), 
+        varhaz = varhaz, ndeath = ndeath, xbar = apply(matrix(xbar, 
+        ncol = nvar), 2, cumsum))
+    
+    if (survtype == 1) 
+        result$surv <- km$inc
+    
+    return(result)
+}
+
+
+str(MYagsurv(y, x, wt, risk, survtype, vartype))
+```
+
+Now that we have these calculations working (###CHECK WITH COUNTING PROCESS 
+DATA###) the remaining tasks are:
+
+  - doing `MYagsurv()` by stratum variable
+  - sending a new data.frame to X (can supply random effect to calculation of risk vector)
+  - allowing user to input random effect by:
+      - entering a value directly, or
+      - by a specific level of (a) grouping factor 
+           - I am not going to worry about doing a random slope for now ...
+             could extend similar to how we do `merTools::predictInterval()`
+
+## `survfitcoxph.fit()` & `survfitcoxph()`
+
+Instead of adapting these functions, at this point I am going to write my 
+own front end to prepare the data for the specific problems I am facing. 
+Most of these two functions are re-creating the data frames,instead of 
+saving them into the model object.  For my case, that means I need to pass
+the stratum variable and send the frames to `MYagsurv()` by the stratum 
+varible.
+
+I also want to send a new data.frame. 
+
+### By stratum variable
+
+
+
