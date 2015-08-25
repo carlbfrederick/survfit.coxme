@@ -295,6 +295,9 @@ Calculating `newrisk` is done in the main survfit.coxph function. It uses the
 ```{r calc newrisk, error=TRUE}
 MYrisk <- function(object, newdata, rfx=0) {
   dMat <- survival:::model.matrix.coxph(object, newdata)
+  xmeans <- object$means
+    names(xmeans) <- names(fixef(object))
+  dMat <- scale(dMat, center=xmeans)
   newrisk <- exp(dMat %*% fixef(object) + rfx)
   return(newrisk)
 }
@@ -404,3 +407,98 @@ survProbs <- function(survHat, newtime) {
 
 Yay!  Everything seems to work on this toy example.  Now I just have to put it 
 together into a single function to ease the process.
+
+# Consolidate all the pieces
+
+With the four functions defined above (and all of the pre-set values), I have
+accomplished my goal of calculating a survival probability for a given time 
+from a `coxme.object` with the ability to specify the random effect value.
+
+  - `MYagsurv()` calculates the baseline survival function and associated
+    values
+  - `MYrisk()` calculates the risk scores for individual rows (i.e. `exp(xB)`)
+  - `predSurv()` re-calculates the baseline survival function for the supplied
+    newdata.
+  - `survProbs()` takes the output of `predSurv()` and calculates the survival
+    probability and cumulative incidence (1-survival probability) of the event
+    at the given time, either by matching to the correct row of the survival 
+    function or interpolating between the two surrounding rows.
+    
+These four object take a total of 13 unique arguments, but these can be 
+reduced to the following:
+
+  - **object**: a coxme.object, must be estimated with x=TRUE and y=TRUE, we 
+    can extract y, x, wt (if any), survtype and vartype from this ... we can 
+    also calculate the risk parameter from this object and `MYrisk()`
+  - **stratVar**: the stratifying variable ... might not work correctly if 
+    there are missing data
+  - **newdata**: as of now, going to limit this to a single row.  Comparisons 
+    can be done by calling the unified function multiple times.
+  - **rfx**: want two choices for user input: either a number to manually set a
+    random effect value or a specific level of a grouping factor
+  - **newtime**: a time for predicted survival probabilities, restricted to be 
+    within the observed time range (inclusive)
+    
+Finally, I want the function to properly handle strata and to return the input
+from `MYagsurv()` and `survProbs()`, but only print the latter. Future 
+functions that would be worthwhile include
+  
+  - a plotting function (preferably a ggplot2 object)
+  - ???
+  
+## Final function
+
+```{r Final.Function}
+survProbs.coxme <- function(object, stratVar=NULL, rfx=0, groupFctr=NULL, level=NULL, newdata, newtime) {
+  #prep values for MYagsurv()
+  y <- object$y
+  x <- object$x
+  if (is.null(object$weights)) {
+    wt <- rep(1, nrow(y))
+  } else wt <- object$weights
+  survtype <- vartype <- switch(object$ties, efron=3, breslow=2)
+##CHECK HERE TO SEE IF I NEED TO MEAN CENTER THESE
+  risk <- exp(x %*% fixef(m1))
+  #do MYagsurv() by strata
+  if (is.null(stratVar)) {
+    stratvar <- wt
+  }
+  if (is.factor(stratVar)) {
+     ustrata <- levels(stratVar)
+  } else ustrata <- sort(unique(stratVar))
+  nstrata <- length(ustrata)
+  survlist <- vector("list", nstrata)
+  names(survlist) <- ustrata
+  for (i in 1:nstrata) {
+    indx <- which(strata == ustrata[i])
+    survlist[[i]] <- MYagsurv(y[indx, , drop = F], x[indx, , drop = F], wt[indx], risk[indx], survtype, vartype)
+  }
+  #Calc newrisk for user-supplied newdata
+  if (!is.null(level)) {
+    if (!is.null(groupFctr)) {
+      rfx <- as.numeric(ranef(object)[[groupFctr]][level])
+    } else rfx <- as.numeric(ranef(object)[[1]][level])
+  }
+  newrisk <- MYrisk(object, newdata, rfx)
+  #Calculate survival function based on covariate profile in newdata
+  survHat <- predSurv(survlist, newrisk)
+  #Find value of survival functionat newtime
+  survProbs <- survProbs(survHat, newtime)
+  print(survProbs)
+  return(list(survList=survlist, survProbs=survProbs))
+}
+```
+
+Lets try it out:
+
+```{r Final.Test}
+test <- survProbs.coxme(m1, arrests$race, rfx=1, newdata=newdata5, newtime=100)
+str(test)
+```
+
+It works for this case where the newdata contain all the covariates for the 
+fixed effects in the exact same order as the formula call and there are no
+missing data, etc...  I haven't made the function any more general than that.
+
+----
+*fin*
