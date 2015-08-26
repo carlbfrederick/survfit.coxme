@@ -6,4 +6,6 @@ went ahead and wrote some functions that would get the job done for me.
 
 They can be run with
 
-`r devtools::source_gist("c351c84ee9fca9888c57")`
+`devtools::source_gist("c351c84ee9fca9888c57")`
+
+**BUT**, this is a very touchy set of functions.
